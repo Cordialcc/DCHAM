@@ -1,0 +1,10 @@
+论文信息/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+outputs/
+*.egg-info/
+dist/
+build/
+.eggs/
