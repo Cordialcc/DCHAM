@@ -1,0 +1,30 @@
+model:
+  base_model: "Qwen/Qwen2.5-VL-7B-Instruct"
+  geolora:
+    d_geo: 256
+    num_bases: 6
+    lora_rank: 16
+    target_layers: [20, 21, 22, 23, 24, 25, 26, 27]
+    target_projections: ["q_proj", "v_proj"]
+
+training:
+  lr_depth_router: 1.0e-4
+  lr_lora_bank: 5.0e-5
+  lr_gates: 1.0e-3
+  warmup_ratio: 0.05
+  num_epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  precision: "bf16"
+  max_seq_length: 2048
+
+data:
+  train_file: "/path/to/spatialqa/split_train.json"
+  val_file: "/path/to/spatialqa/split_val.json"
+  image_dir: "/path/to/nuscenes/images"
+  depth_dir: "/path/to/depth_maps"
+
+output:
+  output_dir: "./outputs_geolora"
+  save_steps: 500
+  logging_steps: 10
