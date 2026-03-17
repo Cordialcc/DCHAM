@@ -306,7 +306,9 @@ class DepthPEFTTrainer(Trainer):
         if (depth_map is not None
                 and self.depth_net is not None
                 and self.method != "standard_lora"):
-            z_geo = self.depth_net(depth_map.to(model.device))
+            z_geo = self.depth_net(depth_map.to(
+                device=model.device, dtype=torch.bfloat16
+            ))
             gate_values = self.gate_bank.get_gate_values(z_geo)
 
             # Modify LoRA scaling in-place
