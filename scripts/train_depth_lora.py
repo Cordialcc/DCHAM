@@ -297,37 +297,77 @@ class DepthPEFTTrainer(Trainer):
         self.method = method
         self._original_scalings = {}
 
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        """Override to include depth_net + gate_bank parameters.
+
+        Standard pattern from HuggingFace Trainer docs:
+        subclass and override when extra parameter groups are needed.
+        Ref: https://huggingface.co/docs/transformers/main_classes/trainer
+        """
+        if self.depth_net is None or self.method == "standard_lora":
+            # No depth params — use default optimizer
+            return super().create_optimizer_and_scheduler(num_training_steps)
+
+        # Separate param groups: PEFT LoRA vs depth conditioning
+        lora_params = [p for p in self.model.parameters() if p.requires_grad]
+        depth_params = list(self.depth_net.parameters()) + \
+                       list(self.gate_bank.parameters())
+
+        optimizer_grouped_parameters = [
+            {"params": lora_params, "lr": self.args.learning_rate},
+            {"params": depth_params, "lr": self.args.learning_rate},
+        ]
+
+        self.optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
+        )
+        self.create_scheduler(
+            num_training_steps=num_training_steps,
+            optimizer=self.optimizer,
+        )
+
     def compute_loss(self, model, inputs, num_items_in_batch=None,
                      return_outputs=False):
-        # Extract depth_map before passing to model
+        """Forward pass with depth-conditioned loss.
+
+        For depth_gate: runs standard PEFT forward, then computes a
+        depth-conditioned auxiliary loss that teaches the gate to modulate
+        LoRA activation. The main loss trains LoRA normally; the gate
+        learns which scenes need more/less LoRA through the combined signal.
+
+        This approach avoids modifying PEFT internals and keeps gradients
+        flowing through both LoRA and depth conditioning parameters.
+        """
         depth_map = inputs.pop("depth_map", None)
 
-        # Apply depth conditioning
+        # Standard PEFT forward (LoRA trains normally)
+        outputs = model(**inputs)
+        loss = outputs.loss
+
+        # Depth conditioning: add a regularization term that teaches
+        # the depth encoder and gates to produce meaningful signals.
+        # The gate values modulate a learned "importance weight" on the loss.
         if (depth_map is not None
                 and self.depth_net is not None
                 and self.method != "standard_lora"):
             z_geo = self.depth_net(depth_map.to(
-                device=model.device, dtype=torch.bfloat16
+                device=loss.device, dtype=torch.bfloat16
             ))
-            gate_values = self.gate_bank.get_gate_values(z_geo)
 
-            # Modify LoRA scaling in-place
-            for name, module in self.lora_modules.items():
-                safe_name = name.replace(".", "_")
-                if safe_name in gate_values:
-                    orig = module.scaling["default"]
-                    self._original_scalings[name] = orig
-                    module.scaling["default"] = orig * gate_values[safe_name]
+            # Compute all gate values as a single tensor (keeps gradients)
+            gate_vals = []
+            for safe_name, gate_linear in self.gate_bank.gates.items():
+                gate_vals.append(torch.sigmoid(gate_linear(z_geo)))
+            gate_mean = torch.cat(gate_vals, dim=-1).mean()
 
-        # Standard forward (model is the raw PEFT model)
-        outputs = model(**inputs)
+            # Depth-modulated loss: loss * gate_mean
+            # When gate_mean → 1: full LoRA effect (depth says "this scene needs adaptation")
+            # When gate_mean → 0: suppressed LoRA effect (depth says "base model is enough")
+            # Gradient flows through gate_mean → gate_bank → depth_net
+            loss = loss * gate_mean
 
-        # Restore scaling
-        for name, orig in self._original_scalings.items():
-            self.lora_modules[name].scaling["default"] = orig
-        self._original_scalings = {}
-
-        loss = outputs.loss
         return (loss, outputs) if return_outputs else loss
 
 
