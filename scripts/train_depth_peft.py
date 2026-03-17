@@ -418,6 +418,10 @@ def main():
     parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_pixels", type=int, default=262144,
+                        help="Max image pixels (controls visual token count). "
+                             "262144≈1248 vis tokens, 602112≈2880 vis tokens.")
+    parser.add_argument("--min_pixels", type=int, default=3136)
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -431,10 +435,15 @@ def main():
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    processor = AutoProcessor.from_pretrained(
+        args.model_path,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+    )
+    print(f"Image resolution: min_pixels={args.min_pixels}, max_pixels={args.max_pixels}")
 
-    # Note: gradient checkpointing conflicts with forward hooks used for
-    # depth conditioning. Memory saved by reducing max_length instead.
+    # Note: gradient checkpointing conflicts with the scaling-modification
+    # approach for depth conditioning. Memory saved by reducing max_pixels.
 
     # Apply PEFT LoRA
     lora_config = LoraConfig(
