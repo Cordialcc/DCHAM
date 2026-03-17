@@ -4,13 +4,13 @@ import torch.nn as nn
 from .config import GeoLoRAConfig
 from .depth_geometry import DepthGeometryNet
 from .lora_bank import LoRABasisBank
-from .router import GeometryRouter
+from .router import GeometryRouter, QuestionConditionedRouter
 
 
 class GeoLoRA(nn.Module):
     """
     Geometry-Conditioned Dynamic LoRA.
-    Orchestrates: DepthGeometryNet -> GeometryRouter -> LoRABasisBank
+    Orchestrates: DepthGeometryNet -> Router -> LoRABasisBank
     Produces per-layer, per-projection LoRA deltas from a depth map.
     """
 
@@ -21,11 +21,19 @@ class GeoLoRA(nn.Module):
 
         self.depth_net = DepthGeometryNet(d_geo=config.d_geo)
 
-        self.router = GeometryRouter(
-            d_geo=config.d_geo,
-            num_bases=config.num_bases,
-            num_layers=num_layers,
-        )
+        if config.router_type == "question_conditioned":
+            self.router = QuestionConditionedRouter(
+                d_geo=config.d_geo,
+                d_lm=config.d_lm,
+                num_bases=config.num_bases,
+                num_layers=num_layers,
+            )
+        else:
+            self.router = GeometryRouter(
+                d_geo=config.d_geo,
+                num_bases=config.num_bases,
+                num_layers=num_layers,
+            )
 
         self.banks = nn.ModuleDict()
         for i in range(num_layers):

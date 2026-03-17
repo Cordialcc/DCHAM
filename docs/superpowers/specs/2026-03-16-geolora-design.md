@@ -40,7 +40,7 @@ Three key distinctions:
 | Adaptation granularity | Fixed for all inputs | Dynamic per scene geometry |
 | Conditioning signal | Text (SHINE) / visual reference (Video2LoRA) | Geometric structure (depth + surface normals) |
 
-**Contribution claim**: *"First geometry-conditioned dynamic model modulation for VLM spatial reasoning — depth maps from monocular estimation determine scene-specific adapter weights, enabling the VLM to adapt its processing strategy to each scene's geometric structure."*
+**Contribution claim**: *"We propose GeoLoRA, which uses depth maps from monocular estimation to dynamically mix a bank of learned LoRA bases, creating scene-specific adapter weights for the VLM's attention layers. Through controlled experiments against static LoRA and depth-token injection baselines at matched parameter budgets, we demonstrate that geometry-conditioned dynamic modulation improves spatial reasoning performance."*
 
 ---
 
@@ -339,13 +339,38 @@ Epochs: 3
 
 ## 9. Paper Contributions
 
-1. **Paradigm**: "Depth as model modulation" — depth maps dynamically condition the VLM's own adapter weights, rather than serving as features to fuse or parameters for a side module. Fundamentally different from all prior depth-VLM integration methods.
+1. **Investigation**: We investigate whether scene geometry should modulate the VLM's own adapter weights — "depth as model modulation" — rather than serving as features to fuse or as parameters for side modules. We provide evidence through controlled comparison against static LoRA, depth-token injection, and feature-alignment baselines at matched parameter budgets.
 
-2. **Mechanism**: Geometry-conditioned LoRA basis mixing — a bank of K learned spatial processing strategies dynamically combined per scene via depth-derived mixing coefficients. Parameter-efficient yet expressive.
+2. **Mechanism**: Geometry-conditioned LoRA basis mixing — a bank of K learned spatial processing strategies dynamically combined per scene via depth-derived mixing coefficients. We empirically validate whether dynamic per-scene modulation outperforms static adaptation.
 
-3. **Architecture**: Scene-adaptive VLM with zero-init gated application — the same base model exhibits different processing behavior for different scene geometries, with stable training via gradual gate opening.
+3. **Architecture**: Scene-adaptive VLM with zero-init gated application and systematic ablation of design choices (rank, bases, layer range, routing strategy).
 
-4. **Evaluation**: Comprehensive experiments on P3's SpatialQA and standard VLM spatial benchmarks.
+4. **Evaluation**: Experiments on both SpatialQA (P3) and external spatial benchmarks (CV-Bench spatial subset, SpatialBench) to validate generalization beyond the thesis-internal dataset. Efficiency analysis (params, FLOPs, latency, VRAM) against all baselines.
+
+---
+
+## 9.1 Required Baselines (Reviewer-Mandated)
+
+| # | Baseline | Purpose | Param-matched? |
+|---|----------|---------|---------------|
+| B1 | Qwen2.5-VL-7B (no adapter) | Zero-shot floor | N/A |
+| B2 | Standard fixed LoRA (same r, layers) | Static vs dynamic adaptation | Yes |
+| B3 | Uniform α = 1/K (no routing) | Scene-specific modulation value | Yes (same arch) |
+| B4 | Random depth (noise input) | Geometry vs privileged signal | Yes (same arch) |
+| B5 | Zero depth (no geometry) | Necessity of depth input | Yes (same arch) |
+| B6 | Corrupted depth (Gaussian noise) | Sensitivity to depth quality | Yes (same arch) |
+| B7 | Depth token injection (Spa3R-style) | Modulation vs token paradigm | Yes |
+| B8 | DCHAM-style side module | Previous thesis approach | Comparable |
+
+---
+
+## 9.2 External Benchmark Evaluation
+
+To address self-contained evaluation concerns:
+- **CV-Bench** spatial subset: external spatial reasoning benchmark
+- **SpatialBench**: if available, independent spatial QA benchmark
+- Cross-dataset transfer: train on SpatialQA, eval on external benchmarks
+- Same-image/different-question analysis on SpatialQA (routing consistency)
 
 ---
 
@@ -383,3 +408,8 @@ Epochs: 3
 | 10 | Replace with standard depth token injection (Spa3R-style) | Modulation vs token injection paradigm |
 | 11 | Visualize α coefficients across scene types | Do different geometries get different routing? |
 | 12 | Visualize gate values during training | Training dynamics of zero-init gates |
+| 13 | Same-image/different-question α consistency | Is routing question-agnostic or scene-driven? |
+| 14 | Textualized depth prompt ("depth at pixel X is Y") | Modulation vs textual depth cue |
+| 15 | GT depth vs P1 predicted depth | Sensitivity to depth estimation quality |
+| 16 | Efficiency table: params/FLOPs/latency/VRAM | Overhead vs baselines |
+| 17 | External benchmark (CV-Bench spatial subset) | Out-of-distribution generalization |

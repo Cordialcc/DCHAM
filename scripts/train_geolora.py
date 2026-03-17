@@ -1,5 +1,5 @@
 """
-Usage: python scripts/train_geolora.py --config configs/geolora.yaml
+Usage: python scripts/train_geolora.py --config configs/geolora.yaml [--method geolora]
 """
 import argparse
 import os
@@ -11,11 +11,147 @@ from transformers import get_cosine_schedule_with_warmup
 
 from geolora.config import GeoLoRAConfig
 from geolora.model import Qwen2VLWithGeoLoRA
+from geolora.baselines import (
+    Qwen2VLWithStaticLoRA,
+    Qwen2VLWithDepthTokens,
+    Qwen2VLWithDepthGate,
+    Qwen2VLWithDepthFiLM,
+    make_uniform_alpha_geolora,
+)
 from geolora.dataset import SpatialQADataset
 from geolora.collator import SpatialQACollator
 
+METHODS = (
+    "geolora", "static_lora", "depth_tokens", "uniform_alpha",
+    "question_conditioned", "depth_gate", "depth_film",
+)
 
-def main(config_path: str):
+
+def build_model(method: str, cfg: dict, geolora_cfg: GeoLoRAConfig):
+    """Instantiate the model variant specified by --method."""
+    base_name = cfg["model"]["base_model"]
+    kwargs = dict(torch_dtype=torch.bfloat16)
+
+    if method == "geolora":
+        print("Loading Qwen2.5-VL + GeoLoRA...")
+        return Qwen2VLWithGeoLoRA.from_pretrained(base_name, geolora_cfg, **kwargs)
+
+    if method == "static_lora":
+        print("Loading Qwen2.5-VL + StaticLoRA...")
+        return Qwen2VLWithStaticLoRA.from_pretrained(base_name, geolora_cfg, **kwargs)
+
+    if method == "uniform_alpha":
+        print("Loading Qwen2.5-VL + GeoLoRA (uniform alpha)...")
+        model = Qwen2VLWithGeoLoRA.from_pretrained(base_name, geolora_cfg, **kwargs)
+        patch = make_uniform_alpha_geolora(geolora_cfg)
+        patch(model)
+        return model
+
+    if method == "depth_tokens":
+        print("Loading Qwen2.5-VL + DepthTokens...")
+        return Qwen2VLWithDepthTokens.from_pretrained(base_name, geolora_cfg, **kwargs)
+
+    if method == "depth_gate":
+        print("Loading Qwen2.5-VL + DepthGate (Level 1)...")
+        return Qwen2VLWithDepthGate.from_pretrained(base_name, geolora_cfg, **kwargs)
+
+    if method == "depth_film":
+        print("Loading Qwen2.5-VL + DepthFiLM (Level 2)...")
+        return Qwen2VLWithDepthFiLM.from_pretrained(base_name, geolora_cfg, **kwargs)
+
+    if method == "question_conditioned":
+        print("Loading Qwen2.5-VL + GeoLoRA (question-conditioned router)...")
+        qc_cfg = GeoLoRAConfig(
+            **{k: getattr(geolora_cfg, k) for k in geolora_cfg.__dataclass_fields__
+               if k != "router_type"},
+            router_type="question_conditioned",
+        )
+        return Qwen2VLWithGeoLoRA.from_pretrained(base_name, qc_cfg, **kwargs)
+
+    raise ValueError(f"Unknown method: {method}")
+
+
+def _has_gates(model) -> bool:
+    return hasattr(model, "_wrapped_layers") and isinstance(model, Qwen2VLWithGeoLoRA)
+
+
+def _log_step(model, method, epoch, global_step, total_steps, loss_val):
+    msg = (
+        f"Epoch {epoch} Step {global_step}/{total_steps} "
+        f"Loss: {loss_val:.4f}"
+    )
+    if _has_gates(model):
+        gate_vals = [
+            w.gate.item()
+            for lw in model._wrapped_layers.values()
+            for w in lw.values()
+        ]
+        avg_gate = sum(gate_vals) / len(gate_vals)
+        msg += f" AvgGate: {avg_gate:.4f}"
+    print(msg)
+
+
+def _save_checkpoint(model, method, output_dir, step):
+    save_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    if method in ("geolora", "uniform_alpha", "question_conditioned"):
+        torch.save(
+            {"geolora": model.geolora.state_dict(), "step": step},
+            os.path.join(save_dir, "geolora.pt"),
+        )
+        gates = {
+            f"layer_{li}_{pn}": w.gate.data.item()
+            for li, lw in model._wrapped_layers.items()
+            for pn, w in lw.items()
+        }
+        torch.save(gates, os.path.join(save_dir, "gates.pt"))
+
+    elif method == "static_lora":
+        lora_sd = {}
+        for li, lw in model._wrapped_layers.items():
+            for pn, wrapper in lw.items():
+                lora_sd[f"layer_{li}_{pn}_A"] = wrapper.lora_A.data
+                lora_sd[f"layer_{li}_{pn}_B"] = wrapper.lora_B.data
+        torch.save(
+            {"static_lora": lora_sd, "step": step},
+            os.path.join(save_dir, "static_lora.pt"),
+        )
+
+    elif method == "depth_tokens":
+        torch.save(
+            {
+                "depth_net": model.depth_net.state_dict(),
+                "token_proj": model.token_proj.state_dict(),
+                "step": step,
+            },
+            os.path.join(save_dir, "depth_tokens.pt"),
+        )
+
+    elif method in ("depth_gate", "depth_film"):
+        # Save depth_net + all wrapped layers (LoRA + conditioning params)
+        wrapper_sd = {}
+        for li, lw in model._wrapped_layers.items():
+            for pn, wrapper in lw.items():
+                wrapper_sd[f"layer_{li}_{pn}_A"] = wrapper.lora_A.data
+                wrapper_sd[f"layer_{li}_{pn}_B"] = wrapper.lora_B.data
+                if method == "depth_gate":
+                    wrapper_sd[f"layer_{li}_{pn}_gate"] = wrapper.gate_proj.state_dict()
+                else:
+                    wrapper_sd[f"layer_{li}_{pn}_film"] = wrapper.film_proj.state_dict()
+        torch.save(
+            {
+                "depth_net": model.depth_net.state_dict(),
+                "wrappers": wrapper_sd,
+                "step": step,
+            },
+            os.path.join(save_dir, f"{method}.pt"),
+        )
+
+    print(f"Saved {method} checkpoint to {save_dir}")
+
+
+def main(config_path: str, method: str):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -24,10 +160,7 @@ def main(config_path: str):
            for k, v in cfg["model"]["geolora"].items()}
     )
 
-    print("Loading Qwen2.5-VL + GeoLoRA...")
-    model = Qwen2VLWithGeoLoRA.from_pretrained(
-        cfg["model"]["base_model"], geolora_cfg, torch_dtype=torch.bfloat16,
-    )
+    model = build_model(method, cfg, geolora_cfg)
 
     train_ds = SpatialQADataset(
         cfg["data"]["train_file"], cfg["data"]["image_dir"],
@@ -50,9 +183,11 @@ def main(config_path: str):
     warmup_steps = int(total_steps * cfg["training"]["warmup_ratio"])
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
+    output_dir = os.path.join(cfg["output"]["output_dir"], method)
+    os.makedirs(output_dir, exist_ok=True)
+
     model.train()
     global_step = 0
-    os.makedirs(cfg["output"]["output_dir"], exist_ok=True)
 
     for epoch in range(cfg["training"]["num_epochs"]):
         for step, batch in enumerate(train_loader):
@@ -75,42 +210,24 @@ def main(config_path: str):
                 global_step += 1
 
                 if global_step % cfg["output"]["logging_steps"] == 0:
-                    gate_vals = [
-                        w.gate.item()
-                        for lw in model._wrapped_layers.values()
-                        for w in lw.values()
-                    ]
-                    avg_gate = sum(gate_vals) / len(gate_vals)
-                    print(
-                        f"Epoch {epoch} Step {global_step}/{total_steps} "
-                        f"Loss: {loss.item()*accum:.4f} "
-                        f"AvgGate: {avg_gate:.4f}"
+                    _log_step(
+                        model, method, epoch, global_step,
+                        total_steps, loss.item() * accum,
                     )
 
                 if global_step % cfg["output"]["save_steps"] == 0:
-                    _save_checkpoint(model, cfg, global_step)
+                    _save_checkpoint(model, method, output_dir, global_step)
 
-    _save_checkpoint(model, cfg, "final")
+    _save_checkpoint(model, method, output_dir, "final")
     print("Training complete.")
-
-
-def _save_checkpoint(model, cfg, step):
-    save_dir = os.path.join(cfg["output"]["output_dir"], f"checkpoint-{step}")
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(
-        {"geolora": model.geolora.state_dict(), "step": step},
-        os.path.join(save_dir, "geolora.pt"),
-    )
-    gates = {
-        f"layer_{li}_{pn}": w.gate.data.item()
-        for li, lw in model._wrapped_layers.items()
-        for pn, w in lw.items()
-    }
-    torch.save(gates, os.path.join(save_dir, "gates.pt"))
-    print(f"Saved to {save_dir}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/geolora.yaml")
-    main(parser.parse_args().config)
+    parser.add_argument(
+        "--method", default="geolora", choices=METHODS,
+        help="Model variant to train (default: geolora)",
+    )
+    args = parser.parse_args()
+    main(args.config, args.method)

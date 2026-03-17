@@ -71,7 +71,15 @@ class Qwen2VLWithGeoLoRA(nn.Module):
     ):
         if depth_maps is not None:
             z_geo = self.geolora.depth_net(depth_maps)
-            alphas = self.geolora.router(z_geo)
+
+            # Question-conditioned router needs text embeddings
+            if self.config.router_type == "question_conditioned":
+                with torch.no_grad():
+                    text_embeds = self.base.model.embed_tokens(input_ids)
+                    q_embed = text_embeds.mean(dim=1)  # (B, d_lm)
+                alphas = self.geolora.router(z_geo, q_embed=q_embed)
+            else:
+                alphas = self.geolora.router(z_geo)
 
             hooks = []
             for local_idx, global_idx in enumerate(self.config.target_layers):

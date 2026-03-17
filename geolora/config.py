@@ -13,6 +13,7 @@ class GeoLoRAConfig:
     lora_rank: int = 16        # r: rank per basis
     target_layers: tuple = (20, 21, 22, 23, 24, 25, 26, 27)  # L=8 upper layers
     target_projections: tuple = ("q_proj", "v_proj")
+    router_type: str = "geometry"  # "geometry" or "question_conditioned"
 
     # Projection dimensions (Qwen2.5-VL-7B GQA)
     q_proj_in: int = 3584
