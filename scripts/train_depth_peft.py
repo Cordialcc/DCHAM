@@ -274,14 +274,14 @@ class DepthConditionedQwen(nn.Module):
               f"lora_rank={lora_rank}, "
               f"conditioning_modules={len(self._conditioning_modules)}")
 
-    def _register_hooks(self, z_geo):
-        """Register forward hooks on LoRA modules to apply depth conditioning.
+    def _apply_depth_conditioning(self, z_geo):
+        """Modify PEFT LoRA scaling based on depth — zero extra memory.
 
-        PEFT LoRA modules compute: output = base_linear(x) + lora_B(lora_A(dropout(x))) * scaling
-        We intercept the output and recompute the LoRA delta to apply depth conditioning.
+        For depth_gate: each LoRA module's scaling *= sigmoid(gate(z_geo)).
+        Modifies scaling in-place before forward, restores after.
+        Works with batch_size=1 (scaling is a scalar, not per-token).
         """
-        self._z_geo = z_geo
-        self._hooks = []
+        self._original_scalings = {}
 
         for name, module in self.model.named_modules():
             if id(module) not in self._lora_name_map:
@@ -289,61 +289,37 @@ class DepthConditionedQwen(nn.Module):
 
             safe_name = self._lora_name_map[id(module)]
             cond_module = self._conditioning_modules[safe_name]
+            adapter_name = "default"
 
-            def make_hook(sn, cm, mod_ref):
-                def hook_fn(mod, inp, output):
-                    if self._z_geo is None:
-                        return output
+            if self.method == "depth_gate":
+                gate = torch.sigmoid(cond_module(z_geo))  # (B, 1)
+                gate_val = gate.mean().item()
+                orig = module.scaling[adapter_name]
+                self._original_scalings[id(module)] = orig
+                module.scaling[adapter_name] = orig * gate_val
 
-                    # PEFT output = frozen(x) + lora_B(lora_A(dropout(x))) * scaling
-                    # For depth_gate: output = frozen(x) + gate * lora_B(lora_A(x)) * scaling
-                    # Efficient: output + (gate - 1) * lora_delta
-                    # This avoids recomputing frozen_out separately
-                    adapter_name = "default"
-                    lora_A = mod_ref.lora_A[adapter_name]
-                    lora_B = mod_ref.lora_B[adapter_name]
-                    scaling = mod_ref.scaling[adapter_name]
-                    x = inp[0]
+            elif self.method == "depth_film":
+                # FiLM: compute a scalar modulation from the mean of gamma
+                film = cond_module(z_geo)  # (B, 2r)
+                gamma_mean = film[:, :self.lora_rank].mean().item()
+                orig = module.scaling[adapter_name]
+                self._original_scalings[id(module)] = orig
+                module.scaling[adapter_name] = orig * gamma_mean
 
-                    if self.method == "depth_gate":
-                        gate = torch.sigmoid(cm(self._z_geo))  # (B, 1)
-                        gate = gate.unsqueeze(1)  # (B, 1, 1)
-                        # output already has lora_delta added (gate=1).
-                        # We want gate * lora_delta, so add (gate - 1) * lora_delta.
-                        lora_delta = lora_B(lora_A(x)) * scaling
-                        return output + (gate - 1.0) * lora_delta
-
-                    elif self.method == "depth_film":
-                        film = cm(self._z_geo)  # (B, 2r)
-                        gamma = film[:, :self.lora_rank].unsqueeze(1)
-                        beta = film[:, self.lora_rank:].unsqueeze(1)
-                        # Replace standard lora output with FiLM-conditioned
-                        z = lora_A(x)
-                        z_cond = gamma * z + beta
-                        conditioned = lora_B(z_cond) * scaling
-                        # Subtract standard delta, add conditioned delta
-                        standard_delta = lora_B(z) * scaling
-                        return output - standard_delta + conditioned
-
-                    return output
-                return hook_fn
-
-            hook = module.register_forward_hook(make_hook(safe_name, cond_module, module))
-            self._hooks.append(hook)
-
-    def _remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks = []
-        self._z_geo = None
+    def _restore_scaling(self):
+        """Restore original PEFT scaling factors."""
+        for name, module in self.model.named_modules():
+            if id(module) in self._original_scalings:
+                module.scaling["default"] = self._original_scalings[id(module)]
+        self._original_scalings = {}
 
     def forward(self, input_ids=None, attention_mask=None, labels=None,
                 pixel_values=None, image_grid_thw=None, depth_map=None,
                 **kwargs):
-        # Register depth conditioning hooks if depth is available
+        # Apply depth conditioning (zero extra memory)
         if depth_map is not None and self.depth_net is not None:
             z_geo = self.depth_net(depth_map)
-            self._register_hooks(z_geo)
+            self._apply_depth_conditioning(z_geo)
 
         # Filter kwargs that the base model doesn't accept
         kwargs.pop("num_items_in_batch", None)
@@ -357,7 +333,9 @@ class DepthConditionedQwen(nn.Module):
             **kwargs,
         )
 
-        self._remove_hooks()
+        if self.depth_net is not None:
+            self._restore_scaling()
+
         return outputs
 
     def trainable_param_count(self):
@@ -439,7 +417,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
