@@ -231,10 +231,7 @@ class DepthConditionedQwen(nn.Module):
             self.depth_net = None
             return
 
-        self.depth_net = DepthGeometryNet(d_geo=d_geo).to(
-            dtype=next(peft_model.parameters()).dtype,
-            device=next(peft_model.parameters()).device,
-        )
+        self.depth_net = DepthGeometryNet(d_geo=d_geo)
 
         # Find LoRA modules and get their ranks
         self._conditioning_modules = nn.ModuleDict()
@@ -260,10 +257,7 @@ class DepthConditionedQwen(nn.Module):
                         proj.bias[lora_rank:].fill_(0.0)
                     self._conditioning_modules[safe_name] = proj
 
-        self._conditioning_modules = self._conditioning_modules.to(
-            dtype=next(peft_model.parameters()).dtype,
-            device=next(peft_model.parameters()).device,
-        )
+        # Device placement handled by Trainer
 
         self.lora_rank = lora_rank
         self._z_geo = None
@@ -457,7 +451,7 @@ def main():
     base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        attn_implementation="flash_attention_2",
     )
     processor = AutoProcessor.from_pretrained(args.model_path)
 
