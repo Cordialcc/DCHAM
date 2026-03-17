@@ -170,39 +170,36 @@ class LazyDepthQwenVLDataset(Dataset):
         return result
 
     def _create_labels(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Mask non-assistant tokens."""
+        """Mask all non-assistant tokens with IGNORE_INDEX.
+
+        Pattern: everything between '<|im_start|>assistant\\n' and '<|im_end|>'
+        is kept as training target; everything else is masked.
+
+        Uses hardcoded token IDs for Qwen2.5-VL's tokenizer (the
+        convert_tokens_to_ids API doesn't handle these special tokens correctly).
+        """
         labels = input_ids.clone()
-        tokenizer = self.processor.tokenizer
+        labels[:] = IGNORE_INDEX  # mask everything first
 
-        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        nl_id = tokenizer.convert_tokens_to_ids("\n")
-
-        assistant_ids = tokenizer.encode("assistant", add_special_tokens=False)
+        im_start_id = 151644  # <|im_start|>
+        im_end_id = 151645    # <|im_end|>
+        assistant_id = 77091  # 'assistant'
+        newline_id = 198      # '\n'
 
         ids = input_ids.tolist()
-        in_assistant = False
-
-        for i in range(len(ids)):
-            if not in_assistant:
-                labels[i] = IGNORE_INDEX
-            if ids[i] == im_start_id:
-                in_assistant = False
-                # Check if next tokens are "assistant\n"
-                if i + 2 < len(ids):
-                    is_asst = True
-                    for j, aid in enumerate(assistant_ids):
-                        if i + 1 + j >= len(ids) or ids[i + 1 + j] != aid:
-                            is_asst = False
-                            break
-                    if is_asst:
-                        in_assistant = True
-                        # Mask the header tokens
-                        for j in range(len(assistant_ids) + 1):  # +1 for \n
-                            if i + j < len(ids):
-                                labels[i + j] = IGNORE_INDEX
-            elif ids[i] == im_end_id:
-                in_assistant = False
+        i = 0
+        while i < len(ids) - 2:
+            if (ids[i] == im_start_id
+                    and ids[i + 1] == assistant_id
+                    and ids[i + 2] == newline_id):
+                j = i + 3
+                while j < len(ids) and ids[j] != im_end_id:
+                    j += 1
+                if j < len(ids):
+                    labels[i + 3 : j + 1] = input_ids[i + 3 : j + 1]
+                i = j + 1
+            else:
+                i += 1
 
         return labels
 
